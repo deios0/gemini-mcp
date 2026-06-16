@@ -644,14 +644,70 @@ function extractResearchText(interaction: StepsInteraction): string {
   return text
 }
 
+// ---------------------------------------------------------------------------
+// OpenRouter fallback for deep research
+// ---------------------------------------------------------------------------
+// When the native Gemini deep-research path is unavailable (no GEMINI_API_KEY,
+// or the Interactions API errors), fall back to OpenRouter's purpose-built
+// deep-research model. The fallback is synchronous (one call returns the full
+// cited report), so we run it inside startDeepResearch, stash the completed
+// text here, and hand checkDeepResearch a synthetic id that resolves to it.
+const OPENROUTER_DEEP_RESEARCH_MODEL =
+  process.env.OPENROUTER_DEEP_RESEARCH_MODEL || 'perplexity/sonar-deep-research'
+const openRouterResults = new Map<string, { status: 'completed' | 'failed'; text: string; error?: string }>()
+
+async function deepResearchViaOpenRouter(prompt: string): Promise<DeepResearchResult> {
+  const orKey = process.env.OPENROUTER_API_KEY
+  if (!orKey) {
+    throw new Error(
+      'No GEMINI_API_KEY for native deep research and no OPENROUTER_API_KEY for fallback.'
+    )
+  }
+  const id = `or-research-${Date.now()}`
+  logger.info(`Deep research via OpenRouter fallback (${OPENROUTER_DEEP_RESEARCH_MODEL})`)
+  try {
+    const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${orKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: OPENROUTER_DEEP_RESEARCH_MODEL,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 8000,
+      }),
+    })
+    if (!resp.ok) {
+      throw new Error(`OpenRouter HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`)
+    }
+    const data: any = await resp.json()
+    let text: string = data?.choices?.[0]?.message?.content || ''
+    const citations: string[] | undefined = data?.citations
+    if (citations && citations.length) {
+      text += '\n\n---\n**Sources:**\n' + citations.map((u, i) => `[${i + 1}] ${u}`).join('\n')
+    }
+    openRouterResults.set(id, { status: 'completed', text: text || '[No research text returned]' })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    openRouterResults.set(id, { status: 'failed', text: '', error: message })
+  }
+  return { id, status: 'pending' }
+}
+
 /**
  * Start a deep research task
  *
- * Uses the @google/genai >= 2.x Interactions "steps" schema. The agent-create
- * call shape (input / agent / background / agent_config) is unchanged from the
- * legacy schema; only the response parsing differs (see checkDeepResearch).
+ * Default engine: native Gemini Deep Research (@google/genai >= 2.x
+ * Interactions "steps" schema). If GEMINI_API_KEY is absent, or the
+ * Interactions create call errors, falls back to OpenRouter
+ * (perplexity/sonar-deep-research) so deep research still works.
  */
 export async function startDeepResearch(prompt: string): Promise<DeepResearchResult> {
+  // No Gemini key at all → straight to OpenRouter fallback.
+  if (!process.env.GEMINI_API_KEY) {
+    return deepResearchViaOpenRouter(prompt)
+  }
   try {
     const interaction = await genAI.interactions.create({
       input: prompt,
@@ -669,6 +725,11 @@ export async function startDeepResearch(prompt: string): Promise<DeepResearchRes
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
+    // Native path failed — fall back to OpenRouter if a key is available.
+    if (process.env.OPENROUTER_API_KEY) {
+      logger.warn(`Gemini deep research failed (${message}); using OpenRouter fallback`)
+      return deepResearchViaOpenRouter(prompt)
+    }
     throw new Error(`Deep research not available: ${message}`)
   }
 }
@@ -682,6 +743,18 @@ export async function startDeepResearch(prompt: string): Promise<DeepResearchRes
  * understands: completed / failed / processing.
  */
 export async function checkDeepResearch(researchId: string): Promise<DeepResearchResult> {
+  // OpenRouter fallback results are computed synchronously at start time and
+  // stashed locally — resolve them here without touching the Gemini SDK.
+  if (researchId.startsWith('or-research-')) {
+    const stored = openRouterResults.get(researchId)
+    if (!stored) {
+      return { id: researchId, status: 'processing' }
+    }
+    if (stored.status === 'failed') {
+      return { id: researchId, status: 'failed', error: stored.error }
+    }
+    return { id: researchId, status: 'completed', outputs: [{ text: stored.text }] }
+  }
   try {
     const interaction = (await genAI.interactions.get(researchId)) as unknown as StepsInteraction
 
