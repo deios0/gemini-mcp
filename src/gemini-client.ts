@@ -591,11 +591,68 @@ export interface DeepResearchResult {
 const DEEP_RESEARCH_AGENT = 'deep-research-pro-preview-12-2025'
 
 /**
+ * Minimal structural type for an Interaction in the @google/genai >= 2.x
+ * "steps" schema. We only declare the fields this module reads so the code is
+ * resilient to additional fields the SDK may add. The SDK's own `Interaction`
+ * type is the source of truth at compile time; this interface documents the
+ * subset we depend on.
+ */
+interface StepsInteraction {
+  id?: string
+  status?: string
+  created?: string
+  agent?: string
+  model?: string
+  // Concatenated text from the last model output (added by the SDK).
+  output_text?: string
+  // The ordered steps that make up the interaction (replaces legacy `outputs`).
+  steps?: Array<{
+    type?: string
+    content?: Array<{ type?: string; text?: string }>
+  }>
+}
+
+/**
+ * Extract the human-readable answer from an Interaction using the new
+ * "steps" schema (@google/genai >= 2.x).
+ *
+ * Preference order:
+ *   1. `interaction.output_text` — SDK-provided convenience accessor that
+ *      concatenates the text of the last model output.
+ *   2. Walk `interaction.steps`, take `model_output` steps, and concatenate
+ *      the `text` parts of their `content` arrays. The last model_output step
+ *      holds the final synthesized report.
+ */
+function extractResearchText(interaction: StepsInteraction): string {
+  if (typeof interaction.output_text === 'string' && interaction.output_text.trim().length > 0) {
+    return interaction.output_text
+  }
+
+  const modelOutputs = (interaction.steps || []).filter((step) => step.type === 'model_output')
+
+  if (modelOutputs.length === 0) {
+    return ''
+  }
+
+  // The final model_output step contains the completed report.
+  const finalStep = modelOutputs[modelOutputs.length - 1]
+  const text = (finalStep.content || [])
+    .filter((part) => part.type === 'text' && typeof part.text === 'string')
+    .map((part) => part.text as string)
+    .join('')
+
+  return text
+}
+
+/**
  * Start a deep research task
+ *
+ * Uses the @google/genai >= 2.x Interactions "steps" schema. The agent-create
+ * call shape (input / agent / background / agent_config) is unchanged from the
+ * legacy schema; only the response parsing differs (see checkDeepResearch).
  */
 export async function startDeepResearch(prompt: string): Promise<DeepResearchResult> {
   try {
-    // The Interactions API is properly typed in @google/genai v1.34.0+
     const interaction = await genAI.interactions.create({
       input: prompt,
       agent: DEEP_RESEARCH_AGENT,
@@ -618,10 +675,15 @@ export async function startDeepResearch(prompt: string): Promise<DeepResearchRes
 
 /**
  * Check deep research status
+ *
+ * Maps the @google/genai >= 2.x Interaction status enum
+ * (`in_progress | requires_action | completed | failed | cancelled |
+ * incomplete | budget_exceeded`) onto the three buckets the tool layer
+ * understands: completed / failed / processing.
  */
 export async function checkDeepResearch(researchId: string): Promise<DeepResearchResult> {
   try {
-    const interaction = await genAI.interactions.get(researchId)
+    const interaction = (await genAI.interactions.get(researchId)) as unknown as StepsInteraction
 
     const status = interaction.status || 'unknown'
 
@@ -635,16 +697,17 @@ export async function checkDeepResearch(researchId: string): Promise<DeepResearc
         created: interaction.created,
         agent: interaction.agent,
         model: interaction.model,
-        outputs: interaction.outputs,
+        // New "steps" schema replaces the legacy "outputs" array.
+        steps: interaction.steps,
+        output_text: interaction.output_text,
         rawInteraction: interaction,
       }
       fs.writeFileSync(outputPath, JSON.stringify(fullResponse, null, 2))
       logger.info(`Full deep research response saved to: ${outputPath}`)
 
       // Extract text for the summary (but full data is saved)
-      const textOutputs = (interaction.outputs || [])
-        .filter((output) => 'type' in output && output.type === 'text')
-        .map((output) => ({ text: (output as { text?: string }).text }))
+      const resultText = extractResearchText(interaction)
+      const textOutputs = resultText ? [{ text: resultText }] : []
 
       return {
         id: researchId,
@@ -652,14 +715,20 @@ export async function checkDeepResearch(researchId: string): Promise<DeepResearc
         outputs: textOutputs,
         savedPath: outputPath,
       }
-    } else if (status === 'failed' || status === 'cancelled') {
+    } else if (
+      status === 'failed' ||
+      status === 'cancelled' ||
+      status === 'incomplete' ||
+      status === 'budget_exceeded'
+    ) {
       return {
         id: researchId,
         status: 'failed',
-        error: 'Research task failed or was cancelled',
+        error: `Research task ended with status: ${status}`,
       }
     }
 
+    // in_progress, requires_action, or anything else -> still processing
     return {
       id: researchId,
       status: 'processing',
@@ -672,27 +741,21 @@ export async function checkDeepResearch(researchId: string): Promise<DeepResearc
 
 /**
  * Follow up on completed research
+ *
+ * A follow-up is a new model interaction that references the completed
+ * research via `previous_interaction_id`. The answer is read from the new
+ * "steps" schema (output_text / model_output steps).
  */
 export async function followUpResearch(researchId: string, question: string): Promise<string> {
   try {
-    const interaction = await genAI.interactions.create({
+    const interaction = (await genAI.interactions.create({
       input: question,
       model: proModelName,
       previous_interaction_id: researchId,
-    })
+    })) as unknown as StepsInteraction
 
-    // Extract text from TextContent outputs
-    const outputs = interaction.outputs || []
-    const textOutputs = outputs
-      .filter((output) => 'type' in output && output.type === 'text')
-      .map((output) => (output as { text?: string }).text)
-      .filter((text): text is string => !!text)
-
-    if (textOutputs.length > 0) {
-      return textOutputs[textOutputs.length - 1]
-    }
-
-    return 'No text response received'
+    const text = extractResearchText(interaction)
+    return text.length > 0 ? text : 'No text response received'
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     throw new Error(`Research follow-up failed: ${message}`)
