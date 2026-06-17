@@ -652,8 +652,12 @@ function extractResearchText(interaction: StepsInteraction): string {
 // deep-research model. The fallback is synchronous (one call returns the full
 // cited report), so we run it inside startDeepResearch, stash the completed
 // text here, and hand checkDeepResearch a synthetic id that resolves to it.
+// Web-grounded Gemini via OpenRouter (the `:online` plugin gives web search +
+// citations). NOT perplexity/sonar — those returned persistent OpenRouter 502s
+// ("Upstream error from Perplexity … timed out") as of 2026-06-17. Override via
+// OPENROUTER_DEEP_RESEARCH_MODEL.
 const OPENROUTER_DEEP_RESEARCH_MODEL =
-  process.env.OPENROUTER_DEEP_RESEARCH_MODEL || 'perplexity/sonar-deep-research'
+  process.env.OPENROUTER_DEEP_RESEARCH_MODEL || 'google/gemini-2.5-pro:online'
 const openRouterResults = new Map<string, { status: 'completed' | 'failed'; text: string; error?: string }>()
 
 async function deepResearchViaOpenRouter(prompt: string): Promise<DeepResearchResult> {
